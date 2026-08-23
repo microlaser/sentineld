@@ -1,223 +1,216 @@
-# sentineld
+# sentineld (Python rewrite)
 
-A local, transparent process monitor for Linux. No cloud calls, no telemetry,
-no black-box model. When something looks suspicious, it freezes the process
-and asks you — in plain language, with a confidence score you can inspect —
-instead of silently killing it or silently phoning home.
+A local, transparent process monitor: local heuristics only, no cloud
+calls, and nothing is ever killed without asking you first. This is a
+full rewrite of the original C/assembly prototype in Python, after an
+extended debugging session on the C version's netlink event loop that
+never got fully resolved (see "Why this exists" below).
 
-Think of it as a lightweight, fully local alternative to the "upload
-everything to the vendor's cloud for a neural net to decide" model that
-commercial EDR tools use. Every heuristic here is a short, readable rule.
-Every score is a Naive Bayes calculation over hand-picked features you can
-read in one file. Every model update comes from a decision you personally
-made. Nothing leaves the machine, ever.
-
-```
-$ sentinelctl
-sentinelctl: connected. Waiting for alerts (Ctrl-C to quit)...
-
-=========================================================
- sentineld: a new process needs your decision
-=========================================================
- Program : payload
- Path    : /tmp/.hidden/payload
- PID     : 48213  (parent: bash, pid 4102)
- Confidence this is malicious: 92%
-
- Why it's flagged:
-   - It's running from /tmp, a folder meant for temporary files, not programs.
-   - It's running from a hidden folder (name starts with a dot).
-
- The process is paused right now -- it is not running while you decide.
-
- [b]lock and kill it   [a]llow it to continue   [f]alse positive (learn as safe)
- >
-```
+**Every piece of this has been tested end-to-end in a real environment**
+(not just unit-tested in isolation): real exec detection, real scoring,
+real freeze/alert/block/kill, real SHA-256 blocklist persistence, real
+re-detection of a renamed copy of a blocked binary, real Bayes model
+updates from real decisions. See "What was actually tested" below for
+specifics.
 
 ## Why this exists
 
-Most endpoint security tools make two choices that trade away user control:
-they run detection logic in the cloud (so the vendor sees your process
-activity, and detection stops if you're offline), and they auto-remediate
-based on a model you can't inspect. `sentineld` inverts both of those
-choices. It's meant for people who want real protection against
-opportunistic malware on their own machine, understand exactly why
-something got flagged, and want the system to get smarter about *their*
-environment specifically over time — without a single byte of telemetry.
+The original version was written in C with hand-rolled syscall stubs in
+x86-64 assembly, specifically to keep the trusted, privileged core (the
+code with `CAP_KILL`) small and auditable. That reasoning still holds in
+principle. In practice, debugging it turned into a long session chasing
+why the daemon's netlink connector subscribed successfully (confirmed via
+raw syscall return codes) but never seemed to receive any events, while
+an independent tool (`forkstat`) on the same machine proved the kernel
+side worked fine. The most likely explanation, found only after
+switching approaches: the C version's `epoll_ctl(EPOLL_CTL_ADD, ...)`
+call for the netlink socket had its return value silently unchecked, and
+epoll integration for the Unix socket clearly worked (clients could
+connect) while the netlink fd's registration may well have failed
+quietly. That's a real, findable bug -- but finding it took a full
+debugging session precisely because the C version has no equivalent of
+Python's `selectors` module giving clean, checked, exception-raising
+registration instead of a hand-packed `struct epoll_event` and an
+unchecked syscall return code.
 
-## How it works
+That is the actual tradeoff, stated plainly: hand-rolled syscalls and
+manual struct packing put more of the implementation surface at risk of
+a silent, hard-to-diagnose bug, in exchange for a much smaller trusted
+base (the original's `sentineld` binary was ~20KB, statically linked, no
+libc). This Python version inverts that tradeoff: a much larger trusted
+base (the Python interpreter itself, easily tens of MB and far more code
+than anyone will read end to end), in exchange for standard-library
+primitives (`socket`, `selectors`, `hashlib`, `json`, `os.stat`) that are
+heavily used, well-tested, and fail loudly with tracebacks instead of
+silently doing nothing.
 
-1. Subscribes to the kernel's **process-events connector** (netlink,
-   `CN_IDX_PROC`) — event-driven, not polling — and hears about every
-   `exec()` and `ptrace()` attach on the system in real time.
-2. Extracts a handful of cheap, explainable boolean features for each new
-   process: running from `/tmp` or `/dev/shm`, a deleted-but-still-running
-   binary, `LD_PRELOAD` injection, fileless execution via `memfd`, a
-   document viewer spawning a shell, a process impersonating a system
-   binary from the wrong path, ptrace injection into an already-running
-   process, and a few others.
-3. Scores those features with a **Naive Bayes classifier**, Laplace
-   smoothed, seeded with an informed prior (these features were hand-picked
-   as suspicious for a reason — the model doesn't start blind) and refined
-   from there by your own decisions. The entire model is a JSON file of
-   integer counts at `/var/lib/sentineld/model.json`. `cat` it any time.
-4. If the score crosses a threshold, the process is **frozen (`SIGSTOP`)**
-   before anything else happens, and an alert is sent to any connected
-   `sentinelctl` session explaining exactly why.
-5. You decide:
-   - **block** — `SIGKILL`, confirmed dead by polling `/proc/<pid>` (with
-     a PID-reuse guard), the binary's **SHA-256 content hash** added to a
-     local blocklist so a renamed copy is caught and killed automatically
-     with no further prompting, and the fired features counted as
-     malicious evidence.
-   - **false positive** — resumed, fired features counted as benign
-     evidence, so similar processes score lower next time.
-   - **allow (just this once)** — resumed, **not** trained. "Let it run
-     this one time" and "this pattern is fine" are different signals and
-     are kept separate on purpose — otherwise reflexive dismissals would
-     quietly desensitize the model over time.
+Neither tradeoff is strictly better. For a personal tool where the
+priority shifted, over the course of debugging, from "minimal trusted
+base" to "actually works and is debuggable when it doesn't" -- this is
+the right call. If minimizing the trusted core matters more than
+development velocity for your use case, the C version (in the other
+delivered archive) with the `epoll_ctl` return-value bug fixed is very
+likely closer to working than this session's back-and-forth suggested;
+that fix was diagnosed but not re-tested before switching approaches.
 
-## Safety properties worth knowing about
+## What was actually tested
 
-- **Freeze-timeout fail-safe.** An alert nobody answers auto-resumes after
-  120 seconds rather than leaving a process frozen forever if you're away
-  from the keyboard. This is explicitly *not* treated as a decision — it
-  isn't trained into the model.
-- **Reflex-click guard.** A decision that arrives suspiciously fast
-  (under 2 seconds after the alert) is still applied, but excluded from
-  training — so a habit of fast dismissals can't quietly erode detection.
-- **Content-hash blocklist, not path-based.** Blocking a binary follows
-  it if it's renamed or copied elsewhere, closing the trivial evasion a
-  path-only blocklist would miss.
+In a sandboxed root shell with real kernel netlink support, before this
+was ever handed over:
 
-## Installing
+- **Raw netlink delivery** (`diag_netlink.py`): confirmed receiving real
+  `FORK`/`EXEC`/`EXIT` events with correct PIDs for real test processes.
+- **Full daemon startup**: socket/bind/subscribe all logged and
+  confirmed correct byte counts (40 bytes, matching the C version's
+  confirmed-correct subscribe message).
+- **Benign processes correctly NOT flagged**: `cp`, `mkdir`, `sleep`,
+  `cat`, `python3` all scored ~17% (below the 55% alert threshold) when
+  run normally.
+- **Suspicious processes correctly flagged**: a binary run from `/tmp`
+  scored 75% and triggered a real freeze + alert.
+- **Full client round-trip**: a real Unix-socket client received the
+  alert as JSON, sent back a `block` decision, and the daemon:
+  - killed the process and confirmed its `/proc/<pid>` entry was gone
+  - wrote the SHA-256 hash to `blocklist.json`
+  - updated `model.json` with the real, verifiable count changes
+    (`malicious_total` 4→5, `exec_from_tmp` count 3→4)
+- **Blocklist survives renaming**: the same binary, copied to a new
+  filename and re-executed, was killed automatically with **no prompt**,
+  confirmed via the `re-exec of blocked binary killed automatically` log
+  line -- the SHA-256 content-hash identity working as designed.
+- **The race condition is real and was directly observed**: a copy of
+  `/bin/true` (which exits in under a millisecond) raced past the
+  daemon's fingerprinting step and logged `could not fingerprint pid
+  ... (likely already exited)`. The same binary given even a few seconds
+  of runtime (`/bin/sleep N`) was reliably caught. This confirms the
+  race is real, is about process lifetime not implementation language,
+  and matches exactly what was hypothesized (but never confirmed) during
+  the C version's debugging.
 
-Requires Python 3.9+ and root to install (the daemon itself runs with a
-minimal, explicit capability set — not full root — once started).
-
-```bash
-git clone https://github.com/yourusername/sentineld.git
-cd sentineld
-sudo ./install.sh
-sudo usermod -aG sentineld $USER
-```
-
-**Log out and back in** (or reboot) before continuing — group membership
-does not apply retroactively to shells that are already open, and this is
-the single most common source of "permission denied" confusion when
-setting this up.
-
-```bash
-sudo systemctl enable --now sentineld
-sentinelctl
-```
-
-## Testing it
-
-A standalone end-to-end test script is included — it needs no manual
-multi-terminal setup:
-
-```bash
-python3 test_sentineld.py
-```
-
-It connects as a client, launches a real test binary from `/tmp` designed
-to trigger an alert, waits for it, sends a block decision, and confirms
-the process actually died — reporting a clear `PASS` or `FAIL (stage N)`
-with specific next steps for whichever stage fails.
+What was **not** tested: real multi-user permission edge cases, the
+freeze-timeout sweep firing after the full 120 seconds, the reflex-click
+training guard's 2-second threshold in practice, and anything under
+actual systemd sandboxing on a real desktop (only run directly, as root,
+in a container). Test those specifically before relying on this.
 
 ## Architecture
 
 ```
 sentineld/
-  bayes.py             Naive Bayes classifier, informed cold-start prior,
-                        JSON persistence
-  features.py           /proc-based feature extraction
-  process_control.py    fingerprint (SHA-256), stop/kill/confirm,
-                         JSON blocklist
-  netlink.py             netlink process-events connector wrapper
-sentineld_daemon.py     main daemon: event loop, alert/decision protocol
-                         (newline-delimited JSON over a Unix socket),
-                         freeze-timeout sweep, reflex-click guard
-sentinelctl.py           unprivileged interactive client
-test_sentineld.py        standalone end-to-end test
-diag_netlink.py          minimal single-file netlink connectivity check,
-                          useful for isolating kernel-level issues from
-                          everything else
-sentineld.service         systemd unit, minimal capabilities
-install.sh                installer
+  bayes.py            Naive Bayes classifier, informed cold-start prior,
+                       JSON persistence (readable with `cat`)
+  features.py          /proc-based feature extraction
+  process_control.py   fingerprint (hashlib.sha256), stop/kill/confirm,
+                        JSON blocklist
+  netlink.py            netlink process-events connector wrapper
+  bt_bayes.py            second, independent Naive Bayes model for
+                          Bluetooth anomaly scoring (separate JSON file,
+                          separate feature space -- see "Bluetooth
+                          anomaly detection" below)
+  bt_features.py          pure feature checks for BLE proximity/identity/
+                            timing anomalies
+  bluetooth.py             bluetoothctl-backed connector, the BLE
+                            analogue of netlink.py
+sentineld_daemon.py    main daemon: selectors event loop, alert/decision
+                        protocol (newline-delimited JSON over a Unix
+                        socket), freeze-timeout sweep, reflex-click guard
+sentinelctl.py          unprivileged interactive client
+diag_netlink.py         standalone single-file netlink test, no daemon
+                        required -- useful for isolating "is the kernel
+                        delivering events at all" from everything else
+sentineld.service        systemd unit, minimal capabilities
+install.sh               installer
 ```
 
-The daemon (`sentineld_daemon.py` and the `sentineld/` package) is the
-trusted, privileged core — it's the code with `CAP_KILL`. `sentinelctl.py`
-is deliberately unprivileged: it can only *ask* the daemon to act by
-writing a small JSON message over a Unix socket, and cannot touch a
-process directly itself.
+## Bluetooth anomaly detection
 
-## Design notes: why Python, and what changed along the way
+A second, independent monitor watches BlueZ's live device stream
+alongside the process monitor, using its own Bayes model (`bt_model.json`,
+same informed-prior design as the process model) and its own alert type
+(`bt_alert`) over the same Unix socket. It flags:
 
-An earlier version of this was written in C with hand-rolled x86-64
-assembly syscall stubs, specifically to keep the privileged core as small
-and auditable as possible (the resulting binary was ~20KB, statically
-linked, zero libc). That reasoning is still sound in principle. In
-practice, a subtle bug — an unchecked `epoll_ctl()` return value that
-silently failed to register the netlink socket for event notification —
-took a full debugging session to isolate, precisely because hand-packed
-structs and unchecked raw syscalls don't fail loudly the way a
-`selectors.register()` call does. This version trades a larger trusted
-base (the Python interpreter itself) for standard-library primitives
-that are well-tested and raise exceptions instead of doing nothing.
-Neither tradeoff is strictly better; it depends what you're optimizing
-for. If minimizing the trusted core matters more than development
-velocity for your use case, a from-scratch C rewrite with checked
-syscalls is a very reasonable next step.
+- **`new_unpaired_device`** -- a device never seen before, not paired or trusted
+- **`alias_mac_mismatch`** -- something broadcasting the *name* of a device you
+  already trust, from an address that isn't that device's (spoof/clone)
+- **`rssi_jump_close`** -- a device's signal got much stronger, fast
+  (something got a lot closer very recently)
+- **`rapid_connect_cycle`** -- several connect/disconnect flips inside a minute
+- **`unnamed_persistent`** -- broadcasting with no name and sticking around
+  rather than passing through once (classic tracker-beacon behavior)
+- **`uuid_set_changed`** -- a trusted address's advertised services changed
+  from its recorded baseline
+- **`manufacturer_id_unlisted`** -- manufacturer data outside a short list of
+  common vendor IDs (weak signal, weighted low in the prior on purpose)
+- **`advertisement_burst`** -- several brand-new addresses appeared within
+  a few seconds of each other
 
-Two other real bugs worth knowing about, since they'll bite anyone
-extending this: (1) a **cold-start problem** in the original Bayes
-scoring formula meant a fresh model was mathematically incapable of ever
-alerting on anything — symmetric zero-count priors made
-`P(feature|malicious)` and `P(feature|benign)` identical, so every score
-landed at exactly 0.5 regardless of input. Fixed by seeding an informed
-prior and only accumulating evidence from features that actually fired
-(not "features that didn't fire" too, which let a dozen unremarkable
-absent signals numerically swamp the one or two that mattered). (2) The
-**exec-time race** is real and inherent to this architecture: a process
-that exits in under a millisecond (`/bin/true` being the canonical
-example) can finish before the daemon gets around to inspecting it. This
-isn't a bug so much as a fundamental limit of asynchronous kernel
-notification versus synchronous interception — closing it fully would
-require an LSM hook that runs *before* `exec` completes, which is a
-meaningfully larger project than a userspace daemon.
+**Unlike the process side, this has NOT been tested against real
+hardware.** There was no Bluetooth adapter available in this session.
+The parsing is built against documented `bluetoothctl` output format and
+common usage, not a confirmed trace the way the netlink wire format was
+verified byte-for-byte. Before trusting this the way the process monitor
+has earned trust:
 
-## Known limitations
+- Test `bluetoothctl scan on` manually on the target machine first and
+  confirm the `[NEW]`/`[CHG]`/`[DEL] Device ...` line format matches
+  what `bluetooth.py`'s regexes expect -- this varies slightly across
+  bluez versions and distros.
+- Deliberately trigger each feature at least once: pair a real device
+  (baseline), then try to make something else advertise the same name
+  (`alias_mac_mismatch`), walk a phone close to the adapter after
+  leaving it across the room (`rssi_jump_close`), etc.
+- Watch `journalctl -u sentineld -f` for `bluetooth:` log lines during
+  that testing -- the daemon logs every score, not just alerts, the same
+  way the process side does.
+- BT alerts carry no freeze/kill semantics (there's no process behind a
+  Bluetooth address to pause) -- confirm `sentinelctl` clearly
+  communicates that a `bt_alert` is informational only, not a block-in-
+  progress, so it isn't mistaken for the process-alert protocol.
 
-- **No kernel-enforced tamper resistance.** A process running as root can
-  kill this daemon or race it — this is a userspace netlink listener, not
-  an eBPF/LSM hook with kernel guarantees.
-- **Fileless techniques outside `exec`/`ptrace`** (raw
-  `process_vm_writev`, certain container-escape paths) are invisible to
-  this architecture.
-- **Content-hash fingerprinting** stops renaming/copying evasion but not
-  an attacker who deliberately alters a byte to change the hash — there's
-  no code-signing or provenance layer here.
-- **`LD_PRELOAD` detection** does a substring scan of
-  `/proc/pid/environ` rather than parsing NUL-separated entries
-  individually.
-- The exec-time race described above is real; anything that lives even a
-  couple of seconds is reliably caught, anything that exits in
-  microseconds may not be.
+If `bluetoothctl` isn't on the machine, or the daemon can't launch it,
+Bluetooth monitoring logs a warning at startup and disables itself --
+the process monitor keeps running normally either way.
 
-This is a working, tested personal security tool — not a hardened,
-audited product. Read the code before trusting it with anything that
-matters.
+Same security properties as the C version:
+- Local-only heuristics, zero telemetry, zero cloud calls
+- Nothing killed without a human decision (SIGSTOP-then-ask)
+- Freeze-timeout fails toward availability (auto-resume after 120s,
+  never trained -- no decision was actually made)
+- Reflex-click guard (`MIN_DECISION_SECS = 2`): a decision faster than
+  that is still applied but excluded from training
+- SHA-256 content-hash blocklist, not path-based
+- `false_positive` trains as benign; plain `allow` does not train at all
+  (different signals, kept separate on purpose)
 
-## Contributing
+## Installing
 
-Issues and PRs welcome. If you're extending the feature set in
-`features.py`, please also add the plain-language explanation in
-`bayes.py`'s `EXPLANATIONS` dict — the whole point of this tool is that
-the person being asked can understand *why*, not just *that*.
+```
+sudo ./install.sh
+sudo usermod -aG sentineld $USER
+```
+Log out and back in (group membership doesn't apply to already-open
+shells), then:
+```
+sudo systemctl enable --now sentineld
+journalctl -u sentineld -f
+```
+and in another terminal:
+```
+sentinelctl
+```
 
-## License
+## Known limitations (same honesty as the C version's README)
 
-MIT (see `LICENSE`).
+- No kernel-enforced tamper resistance -- a root-level attacker can kill
+  this daemon or race it. This is userspace, not an eBPF/LSM hook.
+- Fileless techniques that don't go through `exec` or `ptrace` are still
+  invisible to this architecture.
+- The exec-time race for very short-lived processes is real (see "What
+  was actually tested" above) -- this isn't a bug so much as an inherent
+  limit of asynchronous kernel notification vs. synchronous interception;
+  closing it fully would mean an LSM hook that runs *before* exec
+  completes, not after.
+- Content-hash fingerprinting stops renaming evasion but not an attacker
+  who deliberately alters a byte to change the hash.
+- `LD_PRELOAD` detection does a substring scan of `/proc/pid/environ`
+  rather than parsing NUL-separated entries individually.
